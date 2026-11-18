@@ -1,3 +1,29 @@
+## frikiot fork: inverter-cap preview
+
+This fork is based on upstream SEM **2.2.0**. Preview **2.2.1b1** adds an
+opt-in policy that starts surplus-managed loads at Auto-start SoC using the
+configured inverter AC ceiling, regardless of measured solar surplus, and
+keeps that permission until Buffer SoC. At Buffer it returns to measured
+excess solar. Existing opt-in controls to disable curtailed forecast learning
+are included as a separate change.
+
+Install this fork through HACS using **frikiot/sem-community** as a custom
+repository (category **Integration**), show prereleases, and select **2.2.1b1**.
+The release must include `solar_energy_management.zip`. This uses the same
+integration domain and replaces the current SEM files; back up your Home
+Assistant configuration before switching and restart Home Assistant afterward.
+
+The load policy is **off by default**. See the [setup and operating limits](docs/INVERTER_CAP_POLICY.md)
+before enabling it. All 32 offline tests pass; live Home Assistant and hardware
+behavior have not been validated. This is a software allocation ceiling, not
+an instantaneous overload protection device. Report fork-specific problems
+in this fork, rather than to upstream.
+
+The original project's documentation follows. Its release badges, installation
+links and release history refer to upstream unless stated otherwise.
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/traktore-org/sem-community/main/icon@2x.png" alt="SEM Logo" width="200">
 </p>

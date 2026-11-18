@@ -96,6 +96,8 @@ conditions, paid-source suppression and the disabled stock paths.
 Home Assistant and pytest are not installed in this environment. No live HA
 reload, hardware response or full HA-dependent suite has been verified.
 
-The accompanying `inverter-cap.patch` applies to the existing local
-`sem-community` forecast fork. This working copy includes that fork's current
-uncommitted changes; the patch contains only the inverter-cap addition.
+This fork starts from upstream SEM 2.2.0. The forecast controls and inverter-cap
+policy are separate commits. Preview 2.2.1b1 packages both changes for HACS;
+the release asset is `solar_energy_management.zip`. The integration domain
+stays `solar_energy_management`, so installing it replaces the current SEM
+files rather than creating a second integration.
