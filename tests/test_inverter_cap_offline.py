@@ -245,11 +245,39 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(a.is_active)
         self.assertFalse(b.is_active)
 
+    async def test_minimum_run_reservation_keeps_priority_for_other_loads(self):
+        high = Device("high", 2600, 1)
+        idle_heater = Device("thermostat_idle", 3238, 2, active=True)
+        pump = Device("minimum_run", 1084, 3, active=True, can_stop=False)
+        idle_heater.get_current_consumption = lambda: 0
+        c = self.controller(high, idle_heater, pump)
+        result = await self.tick(c, inverter_total_load_w=7019)
+        self.assertEqual(result.distributable_surplus_w, 6015)
+        self.assertTrue(high.is_active, "lower-priority minimum run must not starve the first load")
+        self.assertFalse(idle_heater.is_active, "release its restart reservation before starting the first load")
+        self.assertTrue(pump.is_active, "preserve minimum-on time")
+        self.assertEqual(idle_heater.calls, ["stop"])
+
+    async def test_minimum_run_reservation_is_counted_once(self):
+        held = Device("held", 3000, 1, active=True, can_stop=False)
+        extra = Device("extra", 6000, 2)
+        c = self.controller(held, extra)
+        await self.tick(c)
+        self.assertTrue(held.is_active and extra.is_active)
+
     async def test_no_extra_allowance_from_reclaim_or_assist(self):
         a = Device("too_large", 11000)
         c = self.controller(a)
         await self.tick(c, reclaim_w=15000, battery_assist_budget_w=20000, available_power_w=20000)
         self.assertFalse(a.is_active)
+
+    def test_capacity_rejection_does_not_blame_solar(self):
+        d = Device("load", 3000)
+        intent = sc.compute_load_intent(d, remaining_surplus_w=2000, bounded_source="inverter_cap")
+        self.assertEqual(intent.code, sc.RC.LOAD_CAPACITY_SHORT)
+        self.assertIn("2000W left; needs 3000W", intent.reason)
+        solar = sc.compute_load_intent(d, remaining_surplus_w=2000, bounded_source="solar")
+        self.assertEqual(solar.code, sc.RC.LOAD_SURPLUS_SHORT)
 
     async def test_unknown_soc_or_meter_revokes_permission(self):
         for overrides in ({"battery_soc": None}, {"inverter_total_load_w": None}, {"inverter_cap_w": 0}):

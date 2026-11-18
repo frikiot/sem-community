@@ -776,10 +776,16 @@ def compute_load_intent(
         threshold = max(rated, float(getattr(device, "min_power_threshold", 0.0) or 0.0))
         reserve = 0.0 if active else max(0.0, float(
             getattr(device, "start_reserve_w", 0.0) or 0.0))
-        if (_phase_held(device) or (peak_freeze and not active)
-                or threshold <= 0 or remaining_surplus_w < threshold + reserve):
-            return LoadIntent(False, 0.0, None, "load capacity unavailable",
-                              RC.LOAD_SURPLUS_SHORT)
+        if _phase_held(device):
+            return LoadIntent(False, 0.0, None, "phase guard holds this load", RC.LOAD_PHASE_GUARD)
+        if peak_freeze and not active:
+            return LoadIntent(False, 0.0, None, "peak guard blocks a new start", RC.LOAD_PEAK_SHED)
+        if threshold <= 0:
+            return LoadIntent(False, 0.0, None, "load power rating unavailable", RC.LOAD_NO_SOURCE)
+        if remaining_surplus_w < threshold + reserve:
+            return LoadIntent(False, 0.0, None,
+                              f"{bounded_source}: {remaining_surplus_w:.0f}W left; needs {threshold + reserve:.0f}W",
+                              RC.LOAD_CAPACITY_SHORT if bounded_source == "inverter_cap" else RC.LOAD_SURPLUS_SHORT)
         return LoadIntent(True, threshold, bounded_source,
                           f"{bounded_source}: within load capacity",
                           RC.LOAD_ADJUST if active else RC.LOAD_START)
@@ -1595,6 +1601,17 @@ class SurplusController:
 
         remaining = float(remaining_surplus)
         bounded_source = self._inverter_policy_source
+        # Minimum-on runs cannot release their capacity this cycle. Reserve
+        # them before choosing any other loads, even when they rank last.
+        # Otherwise the walk can choose A+B, discover held C at admission,
+        # and reject high-priority A instead of releasing lower-priority B.
+        held_claims = {}
+        if bounded_source is not None:
+            held_claims = {
+                d.device_id: self._inverter_claim(d) for d in devices
+                if self._inverter_managed(d) and d.is_active and not d.can_deactivate()
+            }
+            remaining = max(0.0, remaining - sum(held_claims.values()))
         reclaim_handed = False
         intents = {}
         for device in devices:
@@ -1605,7 +1622,8 @@ class SurplusController:
                 reclaim_handed = True
             tier1 = self._tier1_headroom_w(device)
             intent = compute_load_intent(
-                device, remaining_surplus_w=remaining, tier1_headroom_w=tier1,
+                device, remaining_surplus_w=remaining + held_claims.get(device.device_id, 0.0),
+                tier1_headroom_w=tier1,
                 # (#812) the device's own tariff when it has one
                 price_is_cheap=is_cheap_name(
                     device_price_level(device, price_level)),
@@ -1629,7 +1647,8 @@ class SurplusController:
                     # measured number instead of re-deriving it.
                     device._tier1_batt_w = batt
                     self._tier1_budget_left = max(0.0, self._tier1_budget_left - batt)
-                remaining = max(0.0, remaining - intent.power_w)
+                remaining = max(0.0, remaining - max(
+                    0.0, intent.power_w - held_claims.get(device.device_id, 0.0)))
         return intents
 
     async def _finish_via_desired_state(self, devices, *, remaining_surplus,
@@ -1667,7 +1686,8 @@ class SurplusController:
                            if d is not device and self._inverter_managed(d) and d.is_active)
                 if held + intent.power_w > self._inverter_load_budget_w:
                     intent = LoadIntent(False, 0.0, None,
-                                        "waiting for inverter capacity", RC.LOAD_SURPLUS_SHORT)
+                                        f"{held:.0f}W held + {intent.power_w:.0f}W needed > {self._inverter_load_budget_w:.0f}W load budget",
+                                        RC.LOAD_CAPACITY_SHORT if self._inverter_policy_source == "inverter_cap" else RC.LOAD_SURPLUS_SHORT)
             if self._inverter_policy_source is None or intents[device.device_id].on:
                 await reconcile_load(device, intent,
                                      observer=observer, controller=self)

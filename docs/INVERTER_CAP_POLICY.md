@@ -66,6 +66,17 @@ shedding and minimum run/pause times still apply. SEM stops lower-priority
 loads before admitting replacements, and a load that cannot stop continues
 to reserve its capacity. Device power ratings must be accurate.
 
+Preview 2.2.1b3 reserves minimum-on runs before selecting the other loads.
+This prevents a lower-priority pump that cannot yet stop from blocking a
+higher-priority heater when another, stoppable load could release enough
+capacity. Stops still complete before new starts are admitted.
+
+An enabled heater at its thermostat target can draw 0 W while retaining a
+reservation for its rated power: it could resume heating without another
+SEM command. SEM can release that reservation by switching the relay off,
+subject to minimum-on time. Capacity rejections now name inverter capacity;
+their tooltip includes the relevant wattages instead of blaming low solar.
+
 The opt-in applies to the surplus controller's loads, including loads
 previously labelled Solar only: this switch explicitly authorizes the new
 source policy for them. Off, Peak only, externally managed devices and
@@ -113,7 +124,7 @@ Home Assistant and pytest are not installed in this environment. No live HA
 reload, hardware response or full HA-dependent suite has been verified.
 
 This fork starts from upstream SEM 2.2.0. The forecast controls and inverter-cap
-policy are separate commits. Preview 2.2.1b2 packages both changes for HACS;
+policy are separate commits. Preview 2.2.1b3 packages both changes for HACS;
 the release asset is `solar_energy_management.zip`. The integration domain
 stays `solar_energy_management`, so installing it replaces the current SEM
 files rather than creating a second integration.
