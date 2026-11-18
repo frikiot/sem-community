@@ -657,6 +657,13 @@ class LoadIntent:
     #: (#1174) the reason as a stable code (``reason_codes``); empty = the
     #: source names it. Recorded only, left out of equality.
     code: str = field(default="", compare=False)
+    # A running on/off load can draw less than its requested rating. Keep
+    # capacity accounting separate so a measured 0 W never commands OFF.
+    capacity_w: Optional[float] = None
+
+    @property
+    def capacity_claim_w(self) -> float:
+        return self.power_w if self.capacity_w is None else self.capacity_w
 
 
 def compute_load_intent(
@@ -672,6 +679,7 @@ def compute_load_intent(
     daylight_remaining_s: "Optional[float]" = None,
     plan: "PlanVerdict" = NO_OPINION,
     bounded_source: Optional[str] = None,
+    bounded_claim_w: Optional[float] = None,
 ) -> LoadIntent:
     """(desired-state, phase 1) Pure precedence walk → the load's desired state.
 
@@ -774,6 +782,8 @@ def compute_load_intent(
     if bounded_source is not None:
         rated = _rated_claim(device)
         threshold = max(rated, float(getattr(device, "min_power_threshold", 0.0) or 0.0))
+        claim = (bounded_claim_w if bounded_source == "inverter_cap" and active
+                 and bounded_claim_w is not None else threshold)
         reserve = 0.0 if active else max(0.0, float(
             getattr(device, "start_reserve_w", 0.0) or 0.0))
         if _phase_held(device):
@@ -782,13 +792,14 @@ def compute_load_intent(
             return LoadIntent(False, 0.0, None, "peak guard blocks a new start", RC.LOAD_PEAK_SHED)
         if threshold <= 0:
             return LoadIntent(False, 0.0, None, "load power rating unavailable", RC.LOAD_NO_SOURCE)
-        if remaining_surplus_w < threshold + reserve:
+        if remaining_surplus_w < claim + reserve:
             return LoadIntent(False, 0.0, None,
-                              f"{bounded_source}: {remaining_surplus_w:.0f}W left; needs {threshold + reserve:.0f}W",
+                              f"{bounded_source}: {remaining_surplus_w:.0f}W left; needs {claim + reserve:.0f}W",
                               RC.LOAD_CAPACITY_SHORT if bounded_source == "inverter_cap" else RC.LOAD_SURPLUS_SHORT)
         return LoadIntent(True, threshold, bounded_source,
                           f"{bounded_source}: within load capacity",
-                          RC.LOAD_ADJUST if active else RC.LOAD_START)
+                          RC.LOAD_ADJUST if active else RC.LOAD_START,
+                          capacity_w=claim)
 
     # 3b. A ScheduleDevice past its deadline is a hard commitment — force it on
     #     regardless of surplus or peak posture (matches the old deadline pass,
@@ -1636,7 +1647,9 @@ class SurplusController:
                 # (#638 G4) the joint plan's per-device window verdict this
                 # cycle; absent from the dict = the plan has no say.
                 plan=self._plan_windows.get(device.device_id) or NO_OPINION,
-                bounded_source=bounded_source)
+                bounded_source=bounded_source,
+                bounded_claim_w=self._inverter_claim(device)
+                if bounded_source == "inverter_cap" and device.is_active else None)
             intents[device.device_id] = intent
             # solar/tier1-driven loads consume surplus for lower-priority ones
             if intent.on and intent.source in ("solar", "tier1_battery", "inverter_cap"):
@@ -1648,7 +1661,7 @@ class SurplusController:
                     device._tier1_batt_w = batt
                     self._tier1_budget_left = max(0.0, self._tier1_budget_left - batt)
                 remaining = max(0.0, remaining - max(
-                    0.0, intent.power_w - held_claims.get(device.device_id, 0.0)))
+                    0.0, intent.capacity_claim_w - held_claims.get(device.device_id, 0.0)))
         return intents
 
     async def _finish_via_desired_state(self, devices, *, remaining_surplus,
@@ -1680,13 +1693,13 @@ class SurplusController:
             if self._inverter_policy_source is not None and intent.on and intent.source:
                 # Do not spend watts a lower-priority load has only been
                 # ASKED to release: anti-cycle or a failed stop may hold it.
-                # Reserve live/rated/commanded demand, including new starts
-                # whose power sensor has not caught up yet.
+                # Count reported running draw, with rated/commanded reserves
+                # for unmetered loads and starts awaiting their first report.
                 held = sum(self._inverter_claim(d) for d in devices
                            if d is not device and self._inverter_managed(d) and d.is_active)
-                if held + intent.power_w > self._inverter_load_budget_w:
+                if held + intent.capacity_claim_w > self._inverter_load_budget_w:
                     intent = LoadIntent(False, 0.0, None,
-                                        f"{held:.0f}W held + {intent.power_w:.0f}W needed > {self._inverter_load_budget_w:.0f}W load budget",
+                                        f"{held:.0f}W held + {intent.capacity_claim_w:.0f}W needed > {self._inverter_load_budget_w:.0f}W load budget",
                                         RC.LOAD_CAPACITY_SHORT if self._inverter_policy_source == "inverter_cap" else RC.LOAD_SURPLUS_SHORT)
             if self._inverter_policy_source is None or intents[device.device_id].on:
                 await reconcile_load(device, intent,
@@ -1724,8 +1737,15 @@ class SurplusController:
                 and not getattr(device, "locked_by_operator", False)
                 and not getattr(device, "runs_without_surplus", False))
 
-    @staticmethod
-    def _inverter_claim(device):
+    def _inverter_claim(self, device):
+        from ..devices.base import DeviceType
+        from .inverter_load_cap import reported_running_power_w
+
+        if (self._inverter_policy_source == "inverter_cap"
+                and device.device_type in (DeviceType.SWITCH, DeviceType.CLIMATE)):
+            measured = reported_running_power_w(device)
+            if measured is not None:
+                return measured
         return max(_rated_claim(device), float(device.get_current_consumption() or 0.0),
                    float(getattr(device.status, "allocated_power_w", 0.0) or 0.0))
 

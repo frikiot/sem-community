@@ -58,7 +58,9 @@ export. EV demand is the larger of measured fleet draw and the fleet's
 already-issued power commands, so a newly starting car cannot donate watts
 its meter has not reported yet. The existing regulation offset (normally
 50 W) is reserved even on a zero-export installation. The allowance includes
-already-running managed loads and is spent once, in their priority order.
+already-running managed loads and is spent once. All eligible loads can stay
+on when their total claims fit; priority decides which loads fit only when
+capacity is insufficient.
 
 Daily **minimum** runtime does not end this mode. Daily **maximum** runtime,
 device stop conditions, dependencies, manual off, phase holds, grid-peak
@@ -71,11 +73,23 @@ This prevents a lower-priority pump that cannot yet stop from blocking a
 higher-priority heater when another, stoppable load could release enough
 capacity. Stops still complete before new starts are admitted.
 
-An enabled heater at its thermostat target can draw 0 W while retaining a
-reservation for its rated power: it could resume heating without another
-SEM command. SEM can release that reservation by switching the relay off,
-subject to minimum-on time. Capacity rejections now name inverter capacity;
-their tooltip includes the relevant wattages instead of blaming low solar.
+From 2.2.1b4, a running on/off or climate load with a direct power reading
+counts its measured draw once its start has settled. A valid
+0 W thermostat reading consumes no allowance, so an idle heater can stay
+enabled alongside other loads. This replaces the full-rating reservations
+that unnecessarily blocked other loads in 2.2.1b1–b3.
+
+New starts reserve their expected rating until the power sensor reports
+after activation, or for 60 seconds if it reports only when its value changes.
+Missing/unreadable readings, energy-only estimates and
+variable-power setpoint devices retain rated/commanded reservations. The
+reported draw is used only for capacity accounting; it does not lower the
+device's requested setting. Below Buffer, the measured solar policy applies.
+
+If a thermostat resumes heating, the next control cycles count that draw
+and shed loads if necessary, subject to minimum-on times. This is a reactive
+software ceiling, not a reservation for every possible future load increase.
+Capacity rejections name inverter capacity; their tooltip includes wattages.
 
 The opt-in applies to the surplus controller's loads, including loads
 previously labelled Solar only: this switch explicitly authorizes the new
@@ -124,7 +138,7 @@ Home Assistant and pytest are not installed in this environment. No live HA
 reload, hardware response or full HA-dependent suite has been verified.
 
 This fork starts from upstream SEM 2.2.0. The forecast controls and inverter-cap
-policy are separate commits. Preview 2.2.1b3 packages both changes for HACS;
+policy are separate commits. Preview 2.2.1b4 packages both changes for HACS;
 the release asset is `solar_energy_management.zip`. The integration domain
 stays `solar_energy_management`, so installing it replaces the current SEM
 files rather than creating a second integration.

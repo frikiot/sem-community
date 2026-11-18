@@ -13,7 +13,7 @@ import json
 import sys
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -140,6 +140,7 @@ class Device:
 
     def record_activated(self):
         self._sem_owned = self._sem_commanded = True
+        self._last_activated = datetime.now()
 
     def record_deactivated(self):
         self._sem_owned = self._sem_commanded = False
@@ -187,6 +188,15 @@ class BudgetTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    def meter(self, device, watts):
+        device.power_entity_id = "sensor.test_load_power"
+        device._last_activated = datetime.now(timezone.utc) - timedelta(minutes=10)
+        state = types.SimpleNamespace(state=str(watts),
+            attributes={"unit_of_measurement": "W"}, last_reported=datetime.now(timezone.utc))
+        device.hass = types.SimpleNamespace(states=types.SimpleNamespace(get=lambda _: state))
+        device.get_current_consumption = lambda: (float(state.state) if device.is_active else 0)
+        return state
+
     def controller(self, *devices):
         c = sc.SurplusController(types.SimpleNamespace())
         c._devices = {d.device_id: d for d in devices}
@@ -264,6 +274,93 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         c = self.controller(held, extra)
         await self.tick(c)
         self.assertTrue(held.is_active and extra.is_active)
+
+    async def test_full_battery_keeps_all_loads_on_with_idle_thermostat(self):
+        hot = Device("heater", 2600, 1)
+        cold = Device("idle_thermostat", 3238, 2, active=True)
+        pump = Device("held_pump", 1084, 3, active=True, can_stop=False)
+        self.meter(cold, 0)
+        c = self.controller(hot, cold, pump)
+        await self.tick(c, inverter_total_load_w=7019, available_power_w=0)
+        self.assertTrue(all(d.is_active for d in (hot, cold, pump)))
+        self.assertNotIn("stop", cold.calls)
+        self.assertEqual(cold.status.allocated_power_w, 3238, "metered zero must not rewrite the heater command")
+        # The total rises by the newly-started heater; zero solar still
+        # cannot stop any load while actual demand fits the inverter.
+        await self.tick(c, inverter_total_load_w=9619, available_power_w=0)
+        self.assertTrue(all(d.is_active for d in (hot, cold, pump)))
+
+    async def test_thermostat_resuming_is_shed_only_when_actual_load_exceeds_cap(self):
+        hot = Device("heater", 2600, 1, active=True)
+        cold = Device("thermostat", 3238, 2, active=True)
+        pump = Device("held_pump", 1084, 3, active=True, can_stop=False)
+        st = self.meter(cold, 0)
+        c = self.controller(hot, cold, pump)
+        await self.tick(c, inverter_total_load_w=9619)
+        self.assertTrue(all(d.is_active for d in (hot, cold, pump)))
+        st.state = "3238"
+        await self.tick(c, inverter_total_load_w=11500)
+        self.assertTrue(all(d.is_active for d in (hot, cold, pump)), "all heating loads still fit below 12 kW")
+        await self.tick(c, inverter_total_load_w=12857)
+        self.assertTrue(hot.is_active and pump.is_active)
+        self.assertFalse(cold.is_active)
+
+    async def test_new_start_reserves_rating_until_power_reports_after_start(self):
+        first, second = Device("first", 2600, 1), Device("second", 2600, 2)
+        st = self.meter(first, 0)
+        c = self.controller(first, second)
+        await self.tick(c, inverter_cap_w=5000, inverter_total_load_w=2000)
+        self.assertTrue(first.is_active)
+        self.assertFalse(second.is_active, "a stale pre-start zero must not fund another start")
+        await self.tick(c, inverter_cap_w=5000, inverter_total_load_w=2000)
+        self.assertFalse(second.is_active)
+        st.last_reported = datetime.now(timezone.utc)
+        await self.tick(c, inverter_cap_w=5000, inverter_total_load_w=2000)
+        self.assertTrue(first.is_active and second.is_active)
+
+    async def test_measured_idle_does_not_keep_loads_powered_below_buffer(self):
+        d = Device("idle_thermostat", 3000, active=True)
+        self.meter(d, 0)
+        c = self.controller(d)
+        await self.tick(c, battery_soc=100)
+        self.assertTrue(d.is_active)
+        await self.tick(c, battery_soc=90, available_power_w=0)
+        self.assertFalse(d.is_active)
+
+    def test_unreadable_meter_or_missing_timestamp_keeps_rated_reservation(self):
+        d = Device("load", 3000, active=True)
+        st = self.meter(d, 0)
+        c = self.controller(d)
+        c._inverter_policy_source = "inverter_cap"
+        self.assertEqual(c._inverter_claim(d), 0)
+        d._last_activated = datetime.now(timezone.utc)
+        st.last_reported = None
+        self.assertEqual(c._inverter_claim(d), 3000)
+        st.last_reported = datetime.now(timezone.utc)
+        st.state = "unavailable"
+        d.get_current_consumption = lambda: 0
+        self.assertEqual(c._inverter_claim(d), 3000)
+
+    def test_sensor_reporting_only_changes_can_release_zero_after_settling(self):
+        d = Device("idle_thermostat", 3000, active=True)
+        st = self.meter(d, 0)
+        st.last_reported = d._last_activated - timedelta(hours=1)
+        c = self.controller(d)
+        c._inverter_policy_source = "inverter_cap"
+        self.assertEqual(c._inverter_claim(d), 0)
+        st.state = "unknown"
+        d.get_current_consumption = lambda: 0
+        self.assertEqual(c._inverter_claim(d), 3000, "settling never makes an unreadable sensor valid")
+
+    def test_running_meter_is_unit_aware_and_not_used_for_variable_power_commands(self):
+        d = Device("load", 3000, active=True)
+        st = self.meter(d, 1.2)
+        st.attributes["unit_of_measurement"] = "kW"
+        c = self.controller(d)
+        c._inverter_policy_source = "inverter_cap"
+        self.assertEqual(c._inverter_claim(d), 1200)
+        d.device_type = "setpoint"
+        self.assertEqual(c._inverter_claim(d), 3000)
 
     async def test_no_extra_allowance_from_reclaim_or_assist(self):
         a = Device("too_large", 11000)
