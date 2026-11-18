@@ -27,8 +27,8 @@ class PVPerformanceData:
     annual_specific_yield: float = 0.0     # kWh/kWp estimated annual
 
     # Performance ratio (actual vs expected)
-    performance_vs_forecast: float = 0.0   # % (100% = exactly as forecast)
-    daily_performance_ratio: float = 0.0   # % PR for today
+    performance_vs_forecast: Optional[float] = 0.0   # % (None when disabled)
+    daily_performance_ratio: Optional[float] = 0.0   # % PR for today
 
     # Degradation
     estimated_annual_degradation: float = 0.0  # % per year
@@ -57,8 +57,12 @@ class PVPerformanceData:
             "pv_daily_specific_yield": round(self.daily_specific_yield, 2),
             "pv_monthly_specific_yield": round(self.monthly_specific_yield, 2),
             "pv_annual_specific_yield": round(self.annual_specific_yield, 1),
-            "pv_performance_vs_forecast": round(self.performance_vs_forecast, 1),
-            "pv_daily_performance_ratio": round(self.daily_performance_ratio, 1),
+            "pv_performance_vs_forecast": (
+                None if self.performance_vs_forecast is None
+                else round(self.performance_vs_forecast, 1)),
+            "pv_daily_performance_ratio": (
+                None if self.daily_performance_ratio is None
+                else round(self.daily_performance_ratio, 1)),
             "pv_estimated_annual_degradation": round(self.estimated_annual_degradation, 2),
             "pv_degradation_trend": self.degradation_trend,
             "pv_clipping_losses_kwh": round(self.clipping_losses_kwh, 2),
@@ -113,6 +117,8 @@ class PVPerformanceAnalyzer:
         current_solar_power_w: float,
         forecast_today_kwh: float = 0.0,
         forecast_remaining_kwh: float = 0.0,
+        *,
+        disable_adaptive_forecast: bool = False,
     ) -> PVPerformanceData:
         """Update performance metrics with current data."""
         data = PVPerformanceData()
@@ -151,7 +157,11 @@ class PVPerformanceAnalyzer:
             data.yield_path = "no_system_size_configured"
 
         # Performance vs forecast
-        if forecast_today_kwh > 0:
+        if disable_adaptive_forecast:
+            data.performance_vs_forecast = None
+            data.daily_performance_ratio = None
+            data.performance_path = "disabled"
+        elif forecast_today_kwh > 0:
             data.performance_vs_forecast = (daily_solar_kwh / forecast_today_kwh) * 100
             data.daily_performance_ratio = data.performance_vs_forecast
             data.performance_path = "computed"

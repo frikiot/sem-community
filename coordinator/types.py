@@ -997,7 +997,7 @@ class HotWaterSensorData:
 class PVAnalyticsData:
     """PV analytics data for coordinator sensors."""
     pv_daily_specific_yield: float = 0.0
-    pv_performance_vs_forecast: float = 0.0
+    pv_performance_vs_forecast: Optional[float] = 0.0
     pv_estimated_annual_degradation: float = 0.0
     pv_degradation_trend: str = "unknown"
     # (#422, published 30.08) The analyzer records WHICH branch produced each

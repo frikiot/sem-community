@@ -32,6 +32,10 @@ def _flow_text(flow, key, default, **kwargs):
     return get_text(hass, key, default, **kwargs)
 from .consts.devices import CONTACT_VALUE_SERVICES, SG_READY_CONTACT_DOMAINS
 from .consts.core import DEFAULT_SHED_SIGNAL_LIMIT
+from .consts.core import (
+    CONF_DISABLE_ADAPTIVE_FORECAST, CONF_DISABLE_CURTAILMENT_CHAIN,
+    DEFAULT_DISABLE_ADAPTIVE_FORECAST, DEFAULT_DISABLE_CURTAILMENT_CHAIN,
+)
 from .const import (
     DOMAIN,
     DEFAULT_PHASE_GUARD_TOPOLOGY,
@@ -1611,6 +1615,8 @@ OPTIONS_FLOW_OWNED_KEYS = frozenset({
     "charger_name",
     "charger_to_remove",
     "curtailment_probe_enabled",
+    CONF_DISABLE_CURTAILMENT_CHAIN,
+    CONF_DISABLE_ADAPTIVE_FORECAST,
     "daily_ev_target",
     "daily_ev_target_max",
     "demand_charge_rate",
@@ -3008,6 +3014,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     "curtailment_probe_enabled",
                     default=bool(_c("curtailment_probe_enabled", False)),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_DISABLE_CURTAILMENT_CHAIN,
+                    default=bool(_c(CONF_DISABLE_CURTAILMENT_CHAIN,
+                                    DEFAULT_DISABLE_CURTAILMENT_CHAIN)),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_DISABLE_ADAPTIVE_FORECAST,
+                    default=bool(_c(CONF_DISABLE_ADAPTIVE_FORECAST,
+                                    DEFAULT_DISABLE_ADAPTIVE_FORECAST)),
                 ): selector.BooleanSelector(),
                 vol.Optional(
                     "export_limit_entity",

@@ -2878,6 +2878,8 @@ class SEMSolarSensor(CoordinatorEntity, RestoreSensor):
 
     def _update_from_coordinator(self) -> None:
         """Update entity state from coordinator data."""
+        from .coordinator.forecast_policy import DISABLED_FORECAST_SENSORS
+
         if not self.coordinator.data:
             self._attr_available = False
             self._attr_native_value = None
@@ -2901,6 +2903,14 @@ class SEMSolarSensor(CoordinatorEntity, RestoreSensor):
         if data_key in self.coordinator.data:
             self._attr_available = True  # Data received — sensor is available (#70)
             value = self.coordinator.data[data_key]
+            if (key in DISABLED_FORECAST_SENSORS
+                    and self.coordinator.data.get("forecast_adaptive_source") == "disabled"):
+                # An intentional absence must bypass the dark-read grace;
+                # otherwise the last poisoned ratio remains visible.
+                self._last_good_value = None
+                self._last_good_at = None
+                self._stale_s = 0
+                value = None
 
             # Special handling for charging state
             if self.entity_description.key == "charging_state":
@@ -3030,6 +3040,18 @@ class SEMSolarSensor(CoordinatorEntity, RestoreSensor):
         # Unbound on purpose: a test double may call the property's fget on
         # a MagicMock ``self`` (test_708) — the real base must still run.
         attrs = SEMSolarSensor._extra_state_attributes_base(self)
+        from .coordinator.forecast_policy import DISABLED_FORECAST_SENSORS
+
+        if (self.entity_description.key in DISABLED_FORECAST_SENSORS
+                and (self.coordinator.data or {}).get("forecast_adaptive_source") == "disabled"):
+            attrs = dict(attrs or {})
+            attrs["source"] = "disabled"
+            if self.entity_description.key == "pv_health":
+                attrs["health_path"] = "disabled"
+            elif self.entity_description.key.startswith("pv_"):
+                attrs["performance_path"] = "disabled"
+            else:
+                attrs["trust_path"] = "disabled"
         # (#1053) The EV card names a charger from its power sensor. It used
         # to cut " Power" off the friendly name, which breaks once the name
         # is translated ("EV-lader Vermogen"); the name itself rides along.

@@ -38,10 +38,12 @@ class PvHealth:
     settled_days: int
     downtime_min_today: int
     days_since_full_yield: Optional[int]
-    snow: bool
+    snow: Optional[bool]
+    source: Optional[str] = None
 
     def as_attributes(self) -> dict:
         return {
+            **({"source": self.source} if self.source is not None else {}),
             "ratio_7d": self.ratio_7d,
             "settled_days": self.settled_days,
             "downtime_min_today": self.downtime_min_today,

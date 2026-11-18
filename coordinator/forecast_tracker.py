@@ -86,8 +86,9 @@ class DailyForecastRecord:
 class ForecastTracker:
     """Tracks forecast accuracy and computes correction factors."""
 
-    def __init__(self):
+    def __init__(self, *, disabled: bool = False):
         """Initialize forecast tracker."""
+        self._disabled = disabled
         self._history: deque = deque(maxlen=MAX_HISTORY_DAYS)
         self._today_forecast: float = 0.0
         self._today_actual: float = 0.0
@@ -101,14 +102,14 @@ class ForecastTracker:
         self._correction_path: str = "uninitialized"
         self._correction_bucket_size: int = 0
         self._dampening_path: str = "uninitialized"
-        self._last_confidence: float = 0.0
-        self._last_live_ratio: float = 0.0
-        self._last_normalized_ratio: float = 0.0
-        self._last_blended_pre_clamp: float = 1.0
+        self._last_confidence: Optional[float] = 0.0
+        self._last_live_ratio: Optional[float] = 0.0
+        self._last_normalized_ratio: Optional[float] = 0.0
+        self._last_blended_pre_clamp: Optional[float] = 1.0
         # (#1068) True when today has given enough evidence for the low
         # floor (confidence 1.0 and >= EVIDENCE_MIN_EXPECTED_KWH expected).
         self._last_evidenced: bool = False
-        self._last_corrected_floor: float = DAMPENING_FLOOR_DAWN
+        self._last_corrected_floor: Optional[float] = DAMPENING_FLOOR_DAWN
         # #416: most-recent end-of-confident-day snapshot. Updated only
         # while the dampening calculation is in the ``blended_live``
         # branch — i.e. when intraday confidence is meaningful. At day
@@ -134,6 +135,14 @@ class ForecastTracker:
         # stored records had ``weather_category=unknown`` because the
         # rollover read the post-midnight value.
         self._weather_snapshot: Optional[str] = None
+        if disabled:
+            self._correction_path = "disabled"
+            self._dampening_path = "disabled"
+            self._last_confidence = None
+            self._last_live_ratio = None
+            self._last_normalized_ratio = None
+            self._last_blended_pre_clamp = None
+            self._last_corrected_floor = None
 
     def set_hass(self, hass: Any) -> None:
         """Set Home Assistant instance for reading sun.sun entity."""
@@ -194,6 +203,35 @@ class ForecastTracker:
         """
         today = dt_util.now().strftime("%Y-%m-%d")
 
+        # [SEMDIAG] observation-only (fork). Proves the tracker is being fed
+        # and prints what it is scoring, so a frozen numerator is visible in
+        # the log rather than inferred from published attributes. The ABSENCE
+        # of this line while the #743 skip line repeats is the evidence that
+        # the guard starved the tracker. Logs on change only; never mutates.
+        try:
+            _diag = {
+                "today": today,
+                "sample_actual": round(float(actual_solar_kwh), 2),
+                "sample_forecast": round(float(forecast_today_kwh), 2),
+                "weather": str(weather_condition),
+                "held_actual": round(float(self._today_actual), 2),
+                "held_forecast": round(float(self._today_forecast), 2),
+                "live_ratio": self._last_live_ratio,
+                "normalized": self._last_normalized_ratio,
+                "blended_pre_clamp": self._last_blended_pre_clamp,
+                "corrected_floor": self._last_corrected_floor,
+                "confidence": self._last_confidence,
+                "dampening_path": self._dampening_path,
+                "correction": self._correction_factor,
+                "correction_path": self._correction_path,
+                "bucket": self._correction_bucket_size,
+            }
+            if getattr(self, "_sem_diag_feed", None) != _diag:
+                self._sem_diag_feed = _diag
+                _LOGGER.debug("[SEMDIAG] tracker-fed %s", _diag)
+        except Exception:  # noqa: BLE001 — a probe must never break a cycle
+            pass
+
         # Day rollover — save yesterday's record
         if self._today_date and self._today_date != today:
             self._save_day_record()
@@ -244,6 +282,8 @@ class ForecastTracker:
 
     def _save_day_record(self) -> None:
         """Save yesterday's forecast vs actual to history."""
+        if self._disabled:
+            return
         if not self._today_date or self._today_forecast < MIN_FORECAST_KWH:
             return
 
@@ -269,6 +309,23 @@ class ForecastTracker:
         # unknown) and was responsible for 42 % of PROD records
         # landing in ``weather_category=unknown``.
         weather_for_record = self._weather_snapshot or self._weather_today
+
+        # [SEMDIAG] observation-only (fork). The committed day record, and
+        # which weather term won the #416 snapshot-vs-live choice. On a day
+        # the #743 guard skipped every cycle, this is the line that shows a
+        # frozen dawn sample being written to history at rollover.
+        try:
+            _LOGGER.debug(
+                "[SEMDIAG] day-record %s",
+                {"date": self._today_date, "actual": round(float(actual), 2),
+                 "forecast": round(float(self._today_forecast), 2),
+                 "ratio": round(float(ratio), 3),
+                 "weather_recorded": weather_for_record,
+                 "weather_src": "snapshot" if self._weather_snapshot else "live",
+                 "weather_live": self._weather_today,
+                 "weather_snapshot": self._weather_snapshot})
+        except Exception:  # noqa: BLE001 — a probe must never break a cycle
+            pass
 
         record = DailyForecastRecord(
             date=self._today_date,
@@ -311,6 +368,11 @@ class ForecastTracker:
         sensor can publish it as a diagnostic attribute (#416, mirrors
         the #359 ``classifier_path`` pattern).
         """
+        if self._disabled:
+            self._correction_factor = 1.0
+            self._correction_path = "disabled"
+            self._correction_bucket_size = 0
+            return
         if not self._history:
             self._correction_factor = 1.0
             self._correction_path = "no_history"
@@ -425,35 +487,45 @@ class ForecastTracker:
 
     def apply_correction(self, forecast_kwh: float) -> float:
         """Apply correction factor to a forecast value."""
+        if self._disabled:
+            return forecast_kwh
         return round(forecast_kwh * self._correction_factor, 2)
 
     @property
     def correction_factor(self) -> float:
         """Current correction factor (1.0 = no correction)."""
+        if self._disabled:
+            return 1.0
         return round(self._correction_factor, 3)
 
     @property
-    def accuracy_today(self) -> float:
+    def accuracy_today(self) -> Optional[float]:
         """Today's corrected forecast accuracy (actual / corrected forecast).
 
         Shows how accurate the forecast was AFTER correction — what the user sees.
         100% = perfect, >100% = underforecast, <100% = overforecast.
         """
+        if self._disabled:
+            return None
         corrected = self._today_forecast * self._correction_factor
         if corrected < MIN_FORECAST_KWH:
             return 0.0
         return round(self._today_actual / corrected * 100, 1)
 
     @property
-    def raw_accuracy_today(self) -> float:
+    def raw_accuracy_today(self) -> Optional[float]:
         """Today's raw forecast accuracy (actual / raw forecast, no correction)."""
+        if self._disabled:
+            return None
         if self._today_forecast < MIN_FORECAST_KWH:
             return 0.0
         return round(self._today_actual / self._today_forecast * 100, 1)
 
     @property
-    def accuracy_7d(self) -> float:
+    def accuracy_7d(self) -> Optional[float]:
         """Average forecast accuracy over last 7 days."""
+        if self._disabled:
+            return None
         recent = list(self._history)[-7:]
         valid = [r.accuracy_pct for r in recent if r.forecast_kwh >= MIN_FORECAST_KWH]
         if not valid:
@@ -461,8 +533,10 @@ class ForecastTracker:
         return round(sum(valid) / len(valid), 1)
 
     @property
-    def deviation_today(self) -> float:
+    def deviation_today(self) -> Optional[float]:
         """Today's deviation: actual - forecast (positive = better than forecast)."""
+        if self._disabled:
+            return None
         return round(self._today_actual - self._today_forecast, 2)
 
     @property
@@ -529,6 +603,9 @@ class ForecastTracker:
         mirrors #359's ``classifier_path``) so the sensor can expose it
         as a diagnostic attribute.
         """
+        if self._disabled:
+            self._dampening_path = "disabled"
+            return 1.0
         now = dt_util.now()
         hour = now.hour + now.minute / 60.0
 
@@ -643,6 +720,8 @@ class ForecastTracker:
 
     def apply_dampening(self, forecast_kwh: float) -> float:
         """Apply real-time dampening factor to a forecast value."""
+        if self._disabled:
+            return forecast_kwh
         return round(forecast_kwh * self.dampening_factor, 2)
 
     def corrected_factor(self) -> float:
@@ -650,6 +729,8 @@ class ForecastTracker:
         floor (0.5) until today has given real evidence, then down to 0.1.
         (#1104) A sunny morning never raises it above what the history
         learned (1.0 when the provider is right on average)."""
+        if self._disabled:
+            return 1.0
         factor = self._calculate_dampening_factor()
         floor = DAMPENING_FLOOR_DAWN
         if self._last_evidenced:
@@ -674,6 +755,8 @@ class ForecastTracker:
             return 0.0
         if raw <= 0:
             return 0.0
+        if self._disabled:
+            return raw
         return round(raw * self.corrected_factor(), 2)
 
     def get_data(self) -> Dict[str, Any]:
@@ -741,7 +824,7 @@ class ForecastTracker:
 
     def restore_state(self, state: Dict[str, Any]) -> None:
         """Restore state from persistence."""
-        if not state:
+        if self._disabled or not state:
             return
         for record in state.get("history", []):
             self._history.append(DailyForecastRecord(

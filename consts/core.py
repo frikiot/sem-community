@@ -422,6 +422,12 @@ RECORDER_ATTR_BUDGET_BYTES: Final = RECORDER_MAX_STATE_ATTRS_BYTES - RECORDER_AT
 CONF_INTRADAY_FORECAST: Final = "intraday_forecast"
 DEFAULT_INTRADAY_FORECAST: Final = False
 
+# Independent opt-outs for installations whose measured PV is export-clamped.
+CONF_DISABLE_CURTAILMENT_CHAIN: Final = "sem_disable_curtailment_chain"
+DEFAULT_DISABLE_CURTAILMENT_CHAIN: Final = False
+CONF_DISABLE_ADAPTIVE_FORECAST: Final = "sem_disable_adaptive_forecast"
+DEFAULT_DISABLE_ADAPTIVE_FORECAST: Final = False
+
 # (#1088) Grid CO2 intensity: an optional pick when the crawler's unit-based
 # find is not the source the user means. Unset = the crawler's first find.
 CONF_GRID_CO2_ENTITY: Final = "grid_co2_entity"

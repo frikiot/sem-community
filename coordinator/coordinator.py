@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from ..utils.device_names import charger_display_name, charger_own_name  # (#1053)
 
+import asyncio
 import logging
 import time
 from types import SimpleNamespace
@@ -47,6 +48,10 @@ from .external_control import (
 
 from ..consts.core import CAPABILITY_MISS_CONFIRM_READS, CAPABILITY_MISS_HOLD_S
 from ..consts.core import CONF_INTRADAY_FORECAST, DEFAULT_INTRADAY_FORECAST
+from .forecast_ledger import ForecastLedger
+from .forecast_policy import (
+    ForecastPolicy, forecast_policy, publish_disabled_forecast,
+)
 from ..consts.core import (CONF_CO2_LIVE_INTENSITY, CONF_GRID_CO2_ENTITY,
                            DEFAULT_CO2_LIVE_INTENSITY)
 from ..consts.core import (CONF_OUTDOOR_TEMPERATURE_ENTITY,
@@ -765,6 +770,10 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
         """Initialize the coordinator."""
         self.hass = hass
         self.config = config
+        # Resolve both flags before either learner is constructed/restored.
+        self._forecast_policy = ForecastPolicy.from_config(config)
+        self._forecast_lock = asyncio.Lock()
+        self._forecast_retired = False
         self.config_entry: Optional[ConfigEntry] = None
         # #255: the duplicate GLOBAL EV settings entities were removed; per-charger is
         # canonical. Mirror the primary charger's values into the legacy global config
@@ -914,7 +923,10 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
             # are installed side by side. Unset/"auto" keeps the ladder.
             preferred_source=config.get("solar_forecast_source"),
         )
-        self._forecast_tracker = ForecastTracker()
+        self._forecast_tracker = ForecastTracker(
+            disabled=self._forecast_policy.disable_adaptive_forecast)
+        self._forecast_ledger = ForecastLedger(
+            disabled=self._forecast_policy.disable_adaptive_forecast)
         # (#824) When each broken charger control entity was first seen,
         # and which ones already have a Repair filed. Keyed by
         # (charger_id, entity_id) so two chargers naming the same helper
@@ -3838,7 +3850,44 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
                 )
         return vacation
 
+    async def async_retire_forecast(self) -> None:
+        """Drain the old cycle/backfill before reload, then refuse new work.
+
+        The last completed cycle owns its sample's date. Reload does not
+        synthesize a rollover: an uncommitted tracker day is abandoned, never
+        carried into the new day. Storage.close drains the existing save hooks.
+        """
+        async with self._forecast_lock:
+            self._forecast_retired = True
+
     async def _async_update_data(self) -> Dict[str, Any]:
+        """Serialize a complete cycle against forecast options transitions."""
+        async with self._forecast_lock:
+            if self._forecast_retired:
+                return self.data or {}
+            result = await self._async_update_data_unlocked()
+            # Covers the normal result AND the core-result error fallback.
+            if forecast_policy(self).disable_adaptive_forecast:
+                publish_disabled_forecast(
+                    result, self._forecast_tracker, result.get("forecast_today_kwh"))
+            return result
+
+    def _restore_adaptive_forecast_state(self) -> None:
+        """Quarantine by ignoring both payloads; never erase forensic history."""
+        if forecast_policy(self).disable_adaptive_forecast:
+            return
+        self._forecast_tracker.restore_state(
+            self._storage.export_forecast_tracker_state())
+        self._forecast_ledger = ForecastLedger.from_dict(
+            self._storage.get_forecast_ledger_state() or {})
+
+    def _persist_adaptive_forecast_state(self) -> None:
+        """Leave the quarantined tracker payload intact while disabled."""
+        if not forecast_policy(self).disable_adaptive_forecast:
+            self._storage.import_forecast_tracker_state(
+                self._forecast_tracker.get_state())
+
+    async def _async_update_data_unlocked(self) -> Dict[str, Any]:
         """Update data from sensors and calculate derived values."""
         # Initialize storage on first update
         if self._storage is None and self.config_entry:
@@ -3858,8 +3907,7 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
             self._energy_calculator.restore_state(state)
 
             # Restore forecast tracker state
-            forecast_state = self._storage.export_forecast_tracker_state()
-            self._forecast_tracker.restore_state(forecast_state)
+            self._restore_adaptive_forecast_state()
 
             # Restore consumption predictor state (#3)
             predictor_state = self._storage._daily_data.get("predictor", {})
@@ -5565,9 +5613,7 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
                     self._energy_calculator.get_state()
                 )
                 # Persist forecast tracker state
-                self._storage.import_forecast_tracker_state(
-                    self._forecast_tracker.get_state()
-                )
+                self._persist_adaptive_forecast_state()
                 # Persist device runtimes
                 self._persist_device_runtimes()
                 # Persist predictor state (#3)
@@ -6994,10 +7040,25 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
             # from it sinks the dampening factor — every dampened consumer
             # (fleet remaining-solar, forecast night target) then under-plans
             # exactly the hidden kilowatts the probe reveals.
-            if getattr(self, "_curtailment_day", None) == dt_util.now().date():
+            if (not forecast_policy(self).disable_curtailment_chain
+                    and getattr(self, "_curtailment_day", None) == dt_util.now().date()):
                 _LOGGER.debug(
                     "Forecast tracker: skipping today's sample — curtailment "
                     "confirmed, measured solar is not the sky's answer (#743)")
+                # [SEMDIAG] observation-only (fork). The upstream line proves
+                # the branch was taken; this one carries the numbers, so the
+                # frozen numerator is measurable instead of back-solved from
+                # a published ratio. On change only.
+                try:
+                    _diag = {"daily_solar": str(energy.daily_solar),
+                             "forecast_today": str(
+                                 forecast_data.forecast_today_kwh),
+                             "weather": str(weather_condition)}
+                    if getattr(self, "_sem_diag_skip", None) != _diag:
+                        self._sem_diag_skip = _diag
+                        _LOGGER.debug("[SEMDIAG] tracker-skipped %s", _diag)
+                except Exception:  # noqa: BLE001 — must never break a cycle
+                    pass
             else:
                 self._forecast_tracker.update(
                     forecast_data.forecast_today_kwh, energy.daily_solar, weather_condition,
@@ -7450,6 +7511,7 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
                 monthly_solar_kwh=energy.monthly_solar,
                 current_solar_power_w=power.solar_power,
                 forecast_today_kwh=forecast_data.forecast_today_kwh,
+                disable_adaptive_forecast=forecast_policy(self).disable_adaptive_forecast,
             )
             pv_data.pv_daily_specific_yield = pv.daily_specific_yield
             pv_data.pv_performance_vs_forecast = pv.performance_vs_forecast
@@ -14045,6 +14107,10 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
         probe stays in state 'off' and this returns 0.0 every cycle.
         See ``coordinator/curtailment.py`` for the state machine.
         """
+        if forecast_policy(self).disable_curtailment_chain:
+            self._curtailment_day = None
+            self._curtailment_last = {"state": "disabled", "grant_w": 0.0}
+            return 0.0
         try:
             from .curtailment import CurtailmentProbe, ProbeInputs
 
@@ -14157,6 +14223,18 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
                 "wants_solar": wants_solar,
                 "floor_w": round(floor_w),
             }
+            # [SEMDIAG] observation-only (fork). The probe reasons in watts
+            # and leaves no trace when it DECLINES, so every open question
+            # about it (#743 internals, export_limited, the grant that was
+            # never issued) was previously unanswerable at runtime. Logs the
+            # whole trace dict, on change only.
+            try:
+                _diag = self._curtailment_last
+                if getattr(self, "_sem_diag_probe", None) != _diag:
+                    self._sem_diag_probe = dict(_diag)
+                    _LOGGER.debug("[SEMDIAG] probe %s", _diag)
+            except Exception:  # noqa: BLE001 — must never break a cycle
+                pass
             return grant
         except Exception:  # noqa: BLE001 — the probe must never break a cycle
             self._curtailment_last = {"state": "error", "grant_w": 0.0}
@@ -15373,6 +15451,16 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
             if led is None:
                 led = ledgers[name] = ForecastLedger()
             if actual is not None:
+                # [SEMDIAG] observation-only (fork): what the ledger is being
+                # told actually happened. On a zero-export day this is the
+                # clamped counter becoming persisted history. On change only.
+                try:
+                    _diag = ("source-ledger", today_s, str(actual))
+                    if getattr(self, "_sem_diag_settle_src", None) != _diag:
+                        self._sem_diag_settle_src = _diag
+                        _LOGGER.debug("[SEMDIAG] settle %s", _diag)
+                except Exception:  # noqa: BLE001 — must never break a cycle
+                    pass
                 led.settle(today_s, actual)
 
         # Record the horizons once a day, and only once SUCCESSFULLY — the
@@ -15441,15 +15529,16 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
 
         from .forecast_ledger import ForecastLedger
 
+        disabled = forecast_policy(self).disable_adaptive_forecast
         led = getattr(self, "_forecast_ledger", None)
         if led is None:
             raw = {}
-            if self._storage is not None:
+            if not disabled and self._storage is not None:
                 try:
                     raw = self._storage.get_forecast_ledger_state() or {}
                 except Exception:  # noqa: BLE001
                     raw = {}
-            led = ForecastLedger.from_dict(raw)
+            led = ForecastLedger.from_dict(raw, disabled=disabled)
             self._forecast_ledger = led
 
         today = now_time.date()
@@ -15457,7 +15546,16 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
 
         # Settle today with what has actually arrived (idempotent).
         actual = getattr(energy, "daily_solar", None)
-        if actual is not None:
+        if not disabled and actual is not None:
+            # [SEMDIAG] observation-only (fork), as above for the horizon
+            # ledger that feeds sem_pv_health / trust.
+            try:
+                _diag = ("forecast-ledger", today_s, str(actual))
+                if getattr(self, "_sem_diag_settle_led", None) != _diag:
+                    self._sem_diag_settle_led = _diag
+                    _LOGGER.debug("[SEMDIAG] settle %s", _diag)
+            except Exception:  # noqa: BLE001 — must never break a cycle
+                pass
             led.settle(today_s, actual)
 
         # Record the horizons once a day — once SUCCESSFULLY, which is not the
@@ -15466,7 +15564,7 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
         # forecast was not yet populated burned that day permanently: the rig
         # showed `horizons=[]` against a settled actual, for a day whose
         # forecast was sitting right there.
-        if getattr(self, "_forecast_ledger_day", None) != today_s:
+        if not disabled and getattr(self, "_forecast_ledger_day", None) != today_s:
             recorded = 0
             for horizon, value in (
                 (0, getattr(forecast_data, "forecast_today_kwh", None)),
@@ -16219,8 +16317,16 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
         import time as _time
 
         from ..analytics.pv_health import (
-            SNOW_EXPECT_W, SNOW_YIELD_SHARE, pv_health,
+            SNOW_EXPECT_W, SNOW_YIELD_SHARE, PvHealth, pv_health,
         )
+
+        if forecast_policy(self).disable_adaptive_forecast:
+            return PvHealth(
+                state=None, ratio_7d=None, settled_days=0,
+                downtime_min_today=int(round(float(
+                    getattr(power, "solar_downtime_min_today", 0.0) or 0.0))),
+                days_since_full_yield=None, snow=None, source="disabled",
+            )
 
         now_mono = _time.monotonic() if now_mono is None else float(now_mono)
         days: list = []

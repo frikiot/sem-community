@@ -67,7 +67,8 @@ class HorizonAccuracy:
 class ForecastLedger:
     """Forecasts made for a day, at each horizon, and what the day delivered."""
 
-    def __init__(self, max_days: int = DEFAULT_MAX_DAYS) -> None:
+    def __init__(self, max_days: int = DEFAULT_MAX_DAYS, *, disabled: bool = False) -> None:
+        self._disabled = disabled
         self._max_days = max(1, int(max_days))
         # date -> {"actual": float|None, "f": {horizon:int -> kwh:float}}
         self._days: Dict[str, dict] = {}
@@ -75,6 +76,8 @@ class ForecastLedger:
     # ── writing ──────────────────────────────────────────────────────────
     def record(self, target_date: str, horizon_days: int, forecast_kwh) -> None:
         """Note that today we expect ``target_date`` to produce this much."""
+        if self._disabled:
+            return
         try:
             kwh = float(forecast_kwh)
             h = int(horizon_days)
@@ -88,6 +91,8 @@ class ForecastLedger:
 
     def settle(self, target_date: str, actual_kwh) -> None:
         """Record what the day actually produced."""
+        if self._disabled:
+            return
         try:
             actual = float(actual_kwh)
         except (TypeError, ValueError):
@@ -181,6 +186,8 @@ class ForecastLedger:
         recorded WITHOUT this horizon appearing is "the source does not
         supply it" a claim the ledger can support.
         """
+        if self._disabled:
+            return "disabled"
         try:
             h = int(horizon_days)
         except (TypeError, ValueError):
@@ -220,6 +227,8 @@ class ForecastLedger:
         backfill is a reconstruction from hourly buckets, and where the two
         disagree the one that was there wins.
         """
+        if self._disabled:
+            return 0
         added = 0
         for target, (forecast_kwh, actual_kwh) in (pairs or {}).items():
             date = target.isoformat() if hasattr(target, "isoformat") else str(target)
@@ -243,7 +252,9 @@ class ForecastLedger:
         }
 
     @classmethod
-    def from_dict(cls, raw) -> "ForecastLedger":
+    def from_dict(cls, raw, *, disabled: bool = False) -> "ForecastLedger":
+        if disabled:
+            return cls(disabled=True)
         led = cls(max_days=(raw or {}).get("max_days", DEFAULT_MAX_DAYS))
         for d, r in ((raw or {}).get("days") or {}).items():
             fc = {}

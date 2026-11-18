@@ -283,6 +283,8 @@
           "smart_night_charging": "Reduce night target based on tomorrow's forecast",
           "minimum_solar_power": "Minimum solar power to start EV charging (W)",
           "curtailment_probe_enabled": "Curtailment probe (harvest limited solar)",
+          "sem_disable_curtailment_chain": "Disable curtailment probe and sample skipping",
+          "sem_disable_adaptive_forecast": "Disable adaptive solar forecast",
           "export_limit_entity": "Export-limit entity (optional)"
         },
         "data_description": {
@@ -291,6 +293,8 @@
           "smart_night_charging": "When ON, SEM reduces the night charge target when tomorrow's solar forecast is sufficient.",
           "minimum_solar_power": "Minimum surplus solar power (W) required before SEM starts solar EV charging.",
           "curtailment_probe_enabled": "When your inverter caps grid export (e.g. at negative prices), production clamps to consumption and real solar stays invisible. Opt-in: SEM briefly starts the EV at minimum amps and keeps charging only if production rises to follow.",
+          "sem_disable_curtailment_chain": "Stop probe grants and curtailment day marking; keep the tracker updating. This is independent of adaptive forecasting, which can still learn from clamped production unless disabled separately. Reloads SEM.",
+          "sem_disable_adaptive_forecast": "Use raw solar forecasts with both factors fixed at 1.0. Forecast performance, PV health and trust become unavailable. Existing tracker and ledger history is kept without loading or updating it; turning this off restores that history. Recommended when measured PV is export-clamped. Reloads SEM.",
           "export_limit_entity": "Your inverter's export-limit entity (auto-detected for Huawei, GoodWe, SolaX, Victron and others when empty). Sharpens curtailment detection and prevents unnecessary probes."
         }
       },

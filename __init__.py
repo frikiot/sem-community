@@ -263,6 +263,8 @@ PLATFORMS: list[Platform] = [
 _SKIP_RELOAD_SNAPSHOT_TTL_S = 60.0
 
 _SET_OPTION_STRUCTURAL_KEYS: frozenset[str] = frozenset({
+    # Forecast learners and their immutable policy are rebuilt on a change.
+    "sem_disable_curtailment_chain", "sem_disable_adaptive_forecast",
     # (#1040) Calendar mode's Schedule helper — read when the tariff
     # provider is built, so a change must reload.
     "tariff_schedule_entity",
@@ -3679,6 +3681,11 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     (→ mismatch → reload + clear) or never produce an event at all.
     """
     coordinator = entry.runtime_data if hasattr(entry, "runtime_data") else None
+    from .coordinator.forecast_policy import ForecastPolicy, forecast_policy
+
+    forecast_changed = coordinator is not None and (
+        ForecastPolicy.from_config({**entry.data, **entry.options})
+        != forecast_policy(coordinator))
     snapshot = getattr(coordinator, "_skip_options_reload", None) if coordinator else None
     # #485 G5: only honor a recently-armed snapshot. HA fires this
     # listener for data/title-only entry updates too — there options
@@ -3692,14 +3699,23 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
         not isinstance(armed_at, (int, float))
         or (dt_util.utcnow().timestamp() - armed_at) <= _SKIP_RELOAD_SNAPSHOT_TTL_S
     )
-    if isinstance(snapshot, dict) and snapshot_fresh and dict(entry.options) == snapshot:
+    if (not forecast_changed and isinstance(snapshot, dict) and snapshot_fresh
+            and dict(entry.options) == snapshot):
         _LOGGER.debug("Options update from runtime tweak — skipping reload")
         return
 
     if coordinator is not None:
         coordinator._skip_options_reload = None  # stale — clear before reload
+        await coordinator.async_retire_forecast()
     _LOGGER.info("Config options updated, reloading integration")
-    await hass.config_entries.async_reload(entry.entry_id)
+    try:
+        await hass.config_entries.async_reload(entry.entry_id)
+    finally:
+        # If unloading failed, the still-live coordinator may resume. A closed
+        # lifetime must never resume writing over its replacement's store.
+        if (coordinator is not None and entry.runtime_data is coordinator
+                and not getattr(getattr(coordinator, "_storage", None), "_closed", False)):
+            coordinator._forecast_retired = False
 
 
 async def async_remove_config_entry_device(
@@ -4123,6 +4139,8 @@ async def _async_end_store(coordinator, why: str) -> None:
     nothing of it writes after. For an unload and for a setup that failed
     after the store was loaded (HA retries with a new store and never
     unloads this one). Never raises."""
+    if coordinator is not None:
+        await coordinator.async_retire_forecast()
     storage = getattr(coordinator, "_storage", None)
     if storage is None:
         return
@@ -4169,6 +4187,18 @@ async def _async_register_services(
         )
 
     async def async_backfill_forecast_ledger_service(call) -> None:
+        """Serialize explicit backfill with cycles and options reloads."""
+        from .coordinator.forecast_policy import forecast_policy
+
+        async with coordinator._forecast_lock:
+            if (coordinator._forecast_retired
+                    or forecast_policy(coordinator).disable_adaptive_forecast):
+                _LOGGER.info("Forecast ledger backfill skipped: adaptive forecast disabled or retired")
+                return
+            await _async_backfill_forecast_ledger_unlocked(call)
+        await coordinator.async_request_refresh()
+
+    async def _async_backfill_forecast_ledger_unlocked(call) -> None:
         """(#778) Recover forecast accuracy from history the install already has.
 
         The ledger normally learns forward, seven settled days before it will
@@ -4205,8 +4235,6 @@ async def _async_register_services(
             report.get("added", {}).get(1), report.get("added", {}).get(0),
             report.get("trust", {}).get(1), report.get("trust", {}).get(0),
         )
-        await coordinator.async_request_refresh()
-
     try:
         hass.services.async_register(
             DOMAIN, "backfill_forecast_ledger",
