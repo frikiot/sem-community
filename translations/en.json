@@ -404,14 +404,16 @@
           "battery_replan_interval_min": "Replan interval (min)",
           "battery_prefer_consecutive_window": "Prefer a consecutive charge window",
           "battery_charge_power_limit_entity": "Battery charge-power limit entity (for pacing)",
-          "inverter_ac_limit_w": "Inverter AC output limit"
+          "inverter_ac_limit_w": "Inverter AC output limit",
+          "inverter_cap_loads_enabled": "Use inverter capacity above Auto-start SoC"
         },
         "data_description": {
           "battery_charge_platform": "Which inverter SEM commands for scheduled grid charging. Choose Deye to reveal the Deye wiring step.",
           "battery_replan_interval_min": "How often the charge schedule is recomputed against the latest forecast and prices.",
           "battery_prefer_consecutive_window": "On keeps the cheap hours in one block (fewer start/stop cycles); off picks the individual cheapest hours even if scattered.",
           "battery_charge_power_limit_entity": "The inverter's max-charge-power number that charge pacing writes to (e.g. Huawei's 'Maximum charging power'). Leave empty to keep pacing advisory-only.",
-          "inverter_ac_limit_w": "Your inverter's maximum AC output in watts. Charge pacing opens its cap wherever solar would exceed this, so clipped sun is captured. 0 = not set."
+          "inverter_ac_limit_w": "Your inverter's maximum AC output in watts. Used by charge pacing and, when enabled, the SoC-based load policy. 0 = not set.",
+          "inverter_cap_loads_enabled": "Run surplus-managed loads within the inverter AC limit after Auto-start SoC is reached, until Buffer SoC. Ignores solar and forecast availability in that band. At Buffer, only measured solar may run these loads. Replaces their battery/grid runtime top-ups and deadline forcing. Requires a positive inverter limit and Auto-start above Buffer. EV and unmanaged demand are reserved; their controls are unchanged. Off by default."
         }
       },
       "notifications": {

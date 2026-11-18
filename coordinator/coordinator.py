@@ -7386,19 +7386,29 @@ class SEMCoordinator(DataUpdateCoordinator, EVControlMixin):
             # completed this cycle has already released its claim by the time
             # the controller allocates.
             self._tick_appliance_scheduler()
+            from .inverter_load_cap import inverter_total_load_w
+            inverter_cap_on = self.config.get("inverter_cap_loads_enabled", False) is True
             allocation = await self._surplus_controller.update(
                 true_surplus_w,
                 price_level=tariff_data.tariff_price_level,
                 peak_state=peak_state,
                 reclaim_w=reclaim_w,
                 battery_priority=battery_priority,
-                battery_soc=btc.soc,
+                battery_soc=(None if inverter_cap_on and getattr(power, "battery_soc_unavailable", False)
+                             else btc.soc),
                 # (#885) the EFFECTIVE floor, not the raw buffer: each
                 # load stops where the house's overnight need begins.
                 battery_buffer_soc=btc.effective_floor_soc,
                 battery_reserve_soc=btc.reserve_soc,
                 battery_assist_budget_w=btc.assist_budget_w,
                 battery_assist_budget_above_w=btc.assist_budget_above_battery_w,
+                inverter_cap_w=(self.config.get("inverter_ac_limit_w", 0) or 0)
+                if inverter_cap_on else None,
+                inverter_auto_start_soc=self.config.get("battery_auto_start_soc", 90),
+                inverter_buffer_soc=btc.buffer_soc,
+                inverter_total_load_w=inverter_total_load_w(
+                    power, getattr(self, "_peak_committed_w_per_cycle", 0.0))
+                if inverter_cap_on else None,
                 observer=self._observer_mode,
                 # (#633) overnight sources are NIGHT sources.
                 is_night=bool(self.time_manager.is_night_mode()),

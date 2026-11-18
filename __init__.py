@@ -265,6 +265,8 @@ _SKIP_RELOAD_SNAPSHOT_TTL_S = 60.0
 _SET_OPTION_STRUCTURAL_KEYS: frozenset[str] = frozenset({
     # Forecast learners and their immutable policy are rebuilt on a change.
     "sem_disable_curtailment_chain", "sem_disable_adaptive_forecast",
+    # Changing the load policy resets its in-memory SoC latch.
+    "inverter_cap_loads_enabled",
     # (#1040) Calendar mode's Schedule helper — read when the tariff
     # provider is built, so a change must reload.
     "tariff_schedule_entity",

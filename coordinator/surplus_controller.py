@@ -671,6 +671,7 @@ def compute_load_intent(
     is_night: bool = True,
     daylight_remaining_s: "Optional[float]" = None,
     plan: "PlanVerdict" = NO_OPINION,
+    bounded_source: Optional[str] = None,
 ) -> LoadIntent:
     """(desired-state, phase 1) Pure precedence walk → the load's desired state.
 
@@ -765,6 +766,23 @@ def compute_load_intent(
     #     it is, never re-tuned. Only a shed (clause 2) or its own end stops it.
     if active and getattr(device, "runs_without_surplus", False) is True:
         return LoadIntent(True, held, None, "own run — ends at its own target")
+
+    # The opt-in inverter policy replaces all discretionary paid sources.
+    # A daily MINIMUM, forecast, deadline or cheap-hour plan cannot bypass
+    # its envelope or re-enable battery spending below Buffer. Hard stops,
+    # user modes and equipment-owned runs above still take precedence.
+    if bounded_source is not None:
+        rated = _rated_claim(device)
+        threshold = max(rated, float(getattr(device, "min_power_threshold", 0.0) or 0.0))
+        reserve = 0.0 if active else max(0.0, float(
+            getattr(device, "start_reserve_w", 0.0) or 0.0))
+        if (_phase_held(device) or (peak_freeze and not active)
+                or threshold <= 0 or remaining_surplus_w < threshold + reserve):
+            return LoadIntent(False, 0.0, None, "load capacity unavailable",
+                              RC.LOAD_SURPLUS_SHORT)
+        return LoadIntent(True, threshold, bounded_source,
+                          f"{bounded_source}: within load capacity",
+                          RC.LOAD_ADJUST if active else RC.LOAD_START)
 
     # 3b. A ScheduleDevice past its deadline is a hard commitment — force it on
     #     regardless of surplus or peak posture (matches the old deadline pass,
@@ -1317,6 +1335,9 @@ class SurplusController:
         # passes. Default OFF — the passes stay authoritative until a parity
         # corpus + a real-hardware soak prove the new path identical.
         self._use_desired_state: bool = False
+        self._inverter_cap_active = False
+        self._inverter_policy_source: Optional[str] = None
+        self._inverter_load_budget_w = 0.0
         # (#638 G4) per-cycle window verdicts from the joint energy plan:
         # device_id → True (inside its planned block) / False (planned
         # elsewhere tonight — don't start now). Absent = the plan has no say.
@@ -1573,6 +1594,7 @@ class SurplusController:
                 shed.add(d.device_id)
 
         remaining = float(remaining_surplus)
+        bounded_source = self._inverter_policy_source
         reclaim_handed = False
         intents = {}
         for device in devices:
@@ -1595,10 +1617,11 @@ class SurplusController:
                 is_shed_target=device.device_id in shed, soc_above_reserve=soc_above,
                 # (#638 G4) the joint plan's per-device window verdict this
                 # cycle; absent from the dict = the plan has no say.
-                plan=self._plan_windows.get(device.device_id) or NO_OPINION)
+                plan=self._plan_windows.get(device.device_id) or NO_OPINION,
+                bounded_source=bounded_source)
             intents[device.device_id] = intent
             # solar/tier1-driven loads consume surplus for lower-priority ones
-            if intent.on and intent.source in ("solar", "tier1_battery"):
+            if intent.on and intent.source in ("solar", "tier1_battery", "inverter_cap"):
                 if intent.source == "tier1_battery":
                     batt = max(0.0, intent.power_w - max(0.0, remaining))
                     # (#885) Record what the PACK actually funded for this
@@ -1626,9 +1649,28 @@ class SurplusController:
             peak_shed_all=peak_shed_all)
         allocations: List[SurplusAllocation] = []
         active_count = 0
+        if self._inverter_policy_source is not None:
+            # Release lower-priority demand first. A refused stop continues
+            # to occupy capacity at the admission check below.
+            for device in reversed(devices):
+                if not intents[device.device_id].on:
+                    await reconcile_load(device, intents[device.device_id],
+                                         observer=observer, controller=self)
         for device in devices:
-            await reconcile_load(device, intents[device.device_id],
-                                 observer=observer, controller=self)
+            intent = intents[device.device_id]
+            if self._inverter_policy_source is not None and intent.on and intent.source:
+                # Do not spend watts a lower-priority load has only been
+                # ASKED to release: anti-cycle or a failed stop may hold it.
+                # Reserve live/rated/commanded demand, including new starts
+                # whose power sensor has not caught up yet.
+                held = sum(self._inverter_claim(d) for d in devices
+                           if d is not device and self._inverter_managed(d) and d.is_active)
+                if held + intent.power_w > self._inverter_load_budget_w:
+                    intent = LoadIntent(False, 0.0, None,
+                                        "waiting for inverter capacity", RC.LOAD_SURPLUS_SHORT)
+            if self._inverter_policy_source is None or intents[device.device_id].on:
+                await reconcile_load(device, intent,
+                                     observer=observer, controller=self)
             active = bool(device.is_active)
             consumption = device.get_current_consumption() if active else 0.0
             if active:
@@ -1645,10 +1687,27 @@ class SurplusController:
             distributable_surplus_w=distributable,
             regulation_offset_w=self.regulation_offset,
             allocated_w=total_allocated,
-            unallocated_w=max(0.0, distributable - total_allocated),
+            # Capacity is permission, not measured free solar. Do not emit
+            # fictitious excess-solar events to external automations.
+            unallocated_w=max(0.0, (min(distributable, available_power_w)
+                              if self._inverter_policy_source is not None else distributable)
+                              - total_allocated),
             active_devices=active_count, total_devices=len(self._devices),
             allocations=allocations, last_update=dt_util.now())
         return self._allocation_data
+
+    @staticmethod
+    def _inverter_managed(device):
+        """Only reclaim the draw the capacity walk is actually allowed to stop."""
+        return (device.control_mode == DeviceControlMode.SURPLUS
+                and not getattr(device, "managed_externally", False)
+                and not getattr(device, "locked_by_operator", False)
+                and not getattr(device, "runs_without_surplus", False))
+
+    @staticmethod
+    def _inverter_claim(device):
+        return max(_rated_claim(device), float(device.get_current_consumption() or 0.0),
+                   float(getattr(device.status, "allocated_power_w", 0.0) or 0.0))
 
     async def update(
         self,
@@ -1690,6 +1749,12 @@ class SurplusController:
         # TimeManager. None = no sun data; the cheap-hours grid top-up then
         # keeps its pre-#953 behaviour (unknown is not a claim about the sun).
         daylight_remaining_s: Optional[float] = None,
+        # None preserves the stock policy. 0/invalid while enabled fails
+        # closed. The configured AC ceiling is shared by house + EV + loads.
+        inverter_cap_w: Optional[float] = None,
+        inverter_total_load_w: Optional[float] = None,
+        inverter_auto_start_soc: float = 100.0,
+        inverter_buffer_soc: float = 100.0,
     ) -> SurplusAllocationData:
         """Run the surplus allocation algorithm.
 
@@ -1789,6 +1854,47 @@ class SurplusController:
             LoadManagementState.EMERGENCY,
         )
         peak_shed_all = peak_state == LoadManagementState.EMERGENCY
+        self._inverter_policy_source = None
+        if inverter_cap_w is not None:
+            from .inverter_load_cap import inverter_load_budget, finite_nonnegative
+            devices = self.get_devices_sorted()
+            managed = sum(d.get_current_consumption() for d in devices
+                          if self._inverter_managed(d) and d.is_active)
+            floor = finite_nonnegative(inverter_buffer_soc)
+            reserve = finite_nonnegative(battery_reserve_soc)
+            self._inverter_cap_active, budget = inverter_load_budget(
+                was_active=self._inverter_cap_active, soc=battery_soc,
+                auto_start_soc=inverter_auto_start_soc,
+                buffer_soc=max(floor, reserve) if floor is not None and reserve is not None else None,
+                limit_w=inverter_cap_w, total_load_w=inverter_total_load_w,
+                managed_draw_w=managed,
+                margin_w=max(0.0, self.regulation_offset),
+            )
+            self._inverter_policy_source = (
+                "inverter_cap" if self._inverter_cap_active else "solar")
+            # Below Buffer, use only this cycle's real solar pool; never
+            # smooth fictitious capacity into the subsequent solar mode.
+            if not self._inverter_cap_active:
+                budget = min(budget, max(0.0, (finite_nonnegative(available_power_w) or 0.0)
+                                        - max(0.0, self.regulation_offset)))
+            self._inverter_load_budget_w = budget
+            self._last_surplus = budget
+            self._grid_closed = bool(grid_closed)
+            # The envelope already includes all PV/battery watts. Neither
+            # Tier-1 nor reclaimed charging may be added to it a second time.
+            self._tier1_budget_left = 0.0
+            for d in devices:
+                d._tier1_batt_w = 0.0
+            log_on_change(_LOGGER, "inverter-cap-mode", logging.INFO,
+                          "Load policy: %s", self._inverter_policy_source)
+            return await self._finish_via_desired_state(
+                devices, remaining_surplus=budget, reclaim_w=0.0,
+                battery_priority=battery_priority, price_level=price_level,
+                peak_state=peak_state, peak_freeze=peak_freeze,
+                peak_shed=peak_shed, peak_shed_all=peak_shed_all,
+                distributable=budget, available_power_w=available_power_w,
+                observer=observer)
+        self._inverter_cap_active = False
         # (arc Phase 4) Median-of-3 pre-filter: a SINGLE-cycle spike/dropout
         # (inverter glitch, sensor blip) still moves the EMA below by 30% of its
         # magnitude — enough to flap a marginal load. The median passes only

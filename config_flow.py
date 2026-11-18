@@ -1603,6 +1603,7 @@ OPTIONS_FLOW_OWNED_KEYS = frozenset({
     "battery_max_charge_power_w",
     "battery_charge_power_limit_entity",
     "inverter_ac_limit_w",
+    "inverter_cap_loads_enabled",
     "battery_max_discharge_power",
     "battery_max_target_soc",
     "battery_min_deficit_kwh",
@@ -4177,6 +4178,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     "inverter_ac_limit_w",
                     default=_c("inverter_ac_limit_w", 0),
                 ): bounds_selector("inverter_ac_limit_w", mode="box"),
+                vol.Optional(
+                    "inverter_cap_loads_enabled",
+                    default=_c("inverter_cap_loads_enabled", False),
+                ): selector.BooleanSelector(),
                 vol.Optional(
                     "battery_charge_power_limit_entity",
                     description={"suggested_value": (
