@@ -6,17 +6,33 @@ not require measured solar surplus or a forecast in that mode.
 
 ## Enable
 
-In SEM's configuration, open the **Battery Charge Scheduler** options page:
+In the SEM dashboard, open **Configuration → All settings → Battery intelligence**:
 
 1. Set **Inverter AC output limit** (`inverter_ac_limit_w`) to the actual
    continuous AC limit for the inverter output supplying these loads.
 2. Enable **Use inverter capacity above Auto-start SoC**
    (`inverter_cap_loads_enabled`, default **false**).
-3. Set **Auto-start SoC above Buffer SoC**, for example 95% and 90%.
+3. Press **Apply** in that section. SEM reloads to use the policy.
+4. In **Battery zones**, set **Auto-start SoC above Buffer SoC**, for example
+   95% and 90%.
 
 Neither charge scheduling nor charge pacing needs to be enabled. The option
-reloads SEM. The existing `solar_energy_management.set_option` action can
-also save `inverter_cap_loads_enabled: true`; use an actual boolean.
+reloads SEM. The switch was missing from the dashboard in preview 2.2.1b1;
+2.2.1b2 adds it. Restart Home Assistant and refresh the dashboard after updating.
+
+On 2.2.1b1, set the AC limit in Battery intelligence, then enable the policy
+using **Developer tools → Actions → YAML**:
+
+```yaml
+action: solar_energy_management.set_option
+data:
+  options:
+    inverter_cap_loads_enabled: true
+```
+
+Use a boolean, not the quoted string `"true"`. Set it to `false` to disable
+the policy. The same setting is also available in Home Assistant's SEM
+options wizard, on its **Battery Charge Scheduler** page.
 
 ## Behaviour
 
@@ -97,7 +113,7 @@ Home Assistant and pytest are not installed in this environment. No live HA
 reload, hardware response or full HA-dependent suite has been verified.
 
 This fork starts from upstream SEM 2.2.0. The forecast controls and inverter-cap
-policy are separate commits. Preview 2.2.1b1 packages both changes for HACS;
+policy are separate commits. Preview 2.2.1b2 packages both changes for HACS;
 the release asset is `solar_energy_management.zip`. The integration domain
 stays `solar_energy_management`, so installing it replaces the current SEM
 files rather than creating a second integration.

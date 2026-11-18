@@ -331,6 +331,7 @@ const STRUCTURAL_KEYS = new Set([
     // #550 — structural TOGGLES: reload the entry too, so they stage + commit on
     // Apply like the pickers (a live flip would reload and discard staged edits).
     'battery_discharge_protection_enabled', 'battery_setpoint_bidirectional',
+    'inverter_cap_loads_enabled',
     // (#809/#869) the setpoint model and its direction select are read at
     // adapter construction, like the flag above.
     'battery_setpoint_model', 'battery_power_direction_entity',
@@ -2892,6 +2893,8 @@ class SEMConfigCard extends SEMLitBase {
                 'number', null, opts, 'config_help_charge_power_limit_entity')}
             ${this._renderOptionNumberInput('inverter_ac_limit_w', 'config_inverter_ac_limit',
                 { min: 0, max: 100000, step: 100, unit: 'W', default: 0 }, opts, 'config_help_inverter_ac_limit')}
+            ${this._renderOptionToggle('inverter_cap_loads_enabled', 'config_inverter_cap_loads',
+                opts, 'config_help_inverter_cap_loads', false)}
             ${/* arc #921 — the grid is not always a sink. Four switches, all
                   default OFF, and their numbers. Same pattern as the pacing
                   switch above: the entity is the source of truth, the card stages. */ ''}

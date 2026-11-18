@@ -171,12 +171,44 @@ test('All settings still shows every row', () => {
     // (#1166) +1 for the battery's own end-of-charge level.
     // (#1079) +2 for "Steered by another party": the battery's and the
     // charger's mode select (the indicator picker shows only when a mode is set).
+    // Fork: +1 for the inverter-cap load policy in Battery intelligence.
     const everyday = renderTab(card()).total;
     const { per, total } = renderTab(card({ advanced: true }));
-    assert.equal(total, 110, `All settings drew ${total} rows`);
+    assert.equal(total, 111, `All settings drew ${total} rows`);
     assert.ok(per.battery_zones >= 9, 'battery knobs and pickers');
     assert.ok(per.ev_chargers >= 15, 'every per-charger row');
     assert.ok(total > everyday * 5);
+});
+
+test('inverter-cap switch and AC ceiling apply together from Battery intelligence', async () => {
+    const el = card({ advanced: true });
+    const calls = [];
+    el._hass.callService = async (...args) => { calls.push(args); };
+    const { tree } = renderTab(el);
+    const rows = findTemplates(tree, 'class="stepper-cell');
+    const policy = rows.find((row) => text(row).includes('config_inverter_cap_loads'));
+    const ceiling = rows.find((row) => text(row).includes('config_inverter_ac_limit'));
+    assert.ok(policy && ceiling, 'policy and ceiling must both be visible');
+    assert.doesNotMatch(text(policy), /toggle-track on/, 'policy defaults off');
+    policy.values.find((v) => typeof v === 'function')();
+    ceiling.values.find((v) => typeof v === 'function')({ target: { value: '5000' } });
+    assert.deepEqual(calls, [], 'edits must wait for Apply');
+    await el._applySection('battery_intelligence');
+    assert.deepEqual(calls, [['solar_energy_management', 'set_option', {
+        entry_id: 'entry1',
+        options: { inverter_cap_loads_enabled: true, inverter_ac_limit_w: 5000 },
+    }]]);
+    assert.deepEqual(el._pending, {});
+    assert.deepEqual(el._staged, {});
+    const saved = el._renderBatteryIntelligence({});
+    const savedRow = findTemplates(saved, 'class="stepper-cell')
+        .find((row) => text(row).includes('config_inverter_cap_loads'));
+    assert.match(text(savedRow), /toggle-track on/, 'saved policy must show enabled');
+    savedRow.values.find((v) => typeof v === 'function')();
+    el._revertSection('battery_intelligence');
+    assert.equal(el._options.inverter_cap_loads_enabled, true, 'Revert must keep the saved policy');
+    assert.deepEqual(el._pending, {});
+    assert.equal(calls.length, 1, 'Revert must not write');
 });
 
 test('the charger keeps its power and its control in Everyday', () => {
